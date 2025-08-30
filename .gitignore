@@ -1,0 +1,24 @@
+# Docker
+.docker/
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# R files
+.Rhistory
+.RData
+.Ruserdata
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment files
+.env
+.env.local
+
+# Docker volumes data
+postgres_data/
+shiny_logs/

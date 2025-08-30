@@ -1,0 +1,194 @@
+# Test Sistemi Shiny Tətbiqi
+library(shiny)
+library(shinydashboard)
+
+# UI - İstifadəçi İnterfeysi
+ui <- dashboardPage(
+  
+  # Header
+  dashboardHeader(title = "Test Sistemi - 600 İstifadəçi"),
+  
+  # Sidebar
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Ana Səhifə", tabName = "home", icon = icon("home")),
+      menuItem("Test", tabName = "test", icon = icon("clipboard-list")),
+      menuItem("Nəticələr", tabName = "results", icon = icon("chart-bar")),
+      menuItem("Sistem", tabName = "system", icon = icon("cog"))
+    )
+  ),
+  
+  # Body
+  dashboardBody(
+    tabItems(
+      
+      # Ana səhifə
+      tabItem(tabName = "home",
+        fluidRow(
+          # Xoş gəlmisiniz box
+          box(
+            width = 12,
+            title = "🎉 Xoş Gəlmisiniz!", 
+            status = "success",
+            solidHeader = TRUE,
+            height = "400px",
+            div(
+              style = "text-align: center; padding: 50px;",
+              h1("Online Test Sistemi", style = "color: #28a745; margin-bottom: 30px;"),
+              h2("20 şəbəkə × 30 kompüter = 600 istifadəçi", style = "color: #6c757d; margin-bottom: 30px;"),
+              br(),
+              div(
+                style = "background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0;",
+                h3("🚀 Docker Container Hazırdır!", style = "color: #007bff;"),
+                h4("📦 GitHub-da Paylaşıma Hazır!", style = "color: #28a745;")
+              ),
+              br(),
+              p("Sistem vaxtı:", strong(textOutput("current_time", inline = TRUE)), 
+                style = "font-size: 16px; color: #495057;")
+            )
+          )
+        )
+      ),
+      
+      # Test səhifəsi
+      tabItem(tabName = "test",
+        fluidRow(
+          box(
+            width = 8,
+            title = "Test Sualları", 
+            status = "primary",
+            solidHeader = TRUE,
+            h3("Test Bölməsi"),
+            p("Bu bölmədə test sualları və cavablar olacaq."),
+            br(),
+            h4("Demo Sual:"),
+            div(
+              style = "background: #e9ecef; padding: 15px; border-radius: 5px;",
+              p(strong("Sual 1:"), "Azərbaycanın paytaxtı hansıdır?"),
+              radioButtons("demo_question", "Cavabınızı seçin:",
+                          choices = list(
+                            "A) Gəncə" = "A",
+                            "B) Bakı" = "B", 
+                            "C) Sumqayıt" = "C",
+                            "D) Lənkəran" = "D"
+                          ), selected = character(0)),
+              br(),
+              actionButton("check_answer", "Cavabı Yoxla", 
+                          class = "btn-success", style = "margin-right: 10px;"),
+              actionButton("next_question", "Növbəti Sual", 
+                          class = "btn-primary")
+            ),
+            br(),
+            verbatimTextOutput("answer_result")
+          ),
+          
+          box(
+            width = 4,
+            title = "Test Məlumatları",
+            status = "info",
+            solidHeader = TRUE,
+            h4("Statistika:"),
+            p("• Cəmi suallar: 50"),
+            p("• Cavablanan: 1"),
+            p("• Doğru cavablar: 0"),
+            p("• Səhv cavablar: 0"),
+            br(),
+            progressBar(id = "test_progress", value = 2, title = "Tamamlama: 2%")
+          )
+        )
+      ),
+      
+      # Nəticələr səhifəsi  
+      tabItem(tabName = "results",
+        fluidRow(
+          box(
+            width = 12,
+            title = "Test Nəticələri",
+            status = "warning", 
+            solidHeader = TRUE,
+            h3("Ümumi Nəticələr"),
+            br(),
+            div(
+              style = "background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;",
+              h4("📊 Sistem Statistikaları:"),
+              p("• Ümumi istifadəçi sayı: 600"),
+              p("• Aktiv testlər: 0"), 
+              p("• Tamamlanmış testlər: 0"),
+              p("• Orta nəticə: 0%")
+            )
+          )
+        )
+      ),
+      
+      # Sistem səhifəsi
+      tabItem(tabName = "system",
+        fluidRow(
+          box(
+            width = 6,
+            title = "Sistem Məlumatları",
+            status = "info",
+            solidHeader = TRUE,
+            verbatimTextOutput("system_info")
+          ),
+          
+          box(
+            width = 6, 
+            title = "Docker Məlumatları",
+            status = "primary",
+            solidHeader = TRUE,
+            div(
+              h4("🐳 Container Status: ✅ İşləyir"),
+              p("• Image: shiny-test-app"),
+              p("• Port: 3838"),
+              p("• Memory: Optimized"),
+              p("• Network: Bridge"),
+              br(),
+              p(strong("Deploy edilmə üçün hazırdır!"))
+            )
+          )
+        )
+      )
+      
+    )
+  )
+)
+
+# Server - Backend məntiq
+server <- function(input, output, session) {
+  
+  # Cari vaxtı göstər
+  output$current_time <- renderText({
+    invalidateLater(1000, session) # Hər saniyə yenilə
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  })
+  
+  # Demo sualın cavabını yoxla
+  output$answer_result <- renderText({
+    if(input$check_answer > 0) {
+      if(isolate(input$demo_question) == "B") {
+        "✅ Doğru! Azərbaycanın paytaxtı Bakıdır."
+      } else if(isolate(input$demo_question) != "") {
+        "❌ Səhv! Doğru cavab: B) Bakı"
+      } else {
+        "⚠️ Zəhmət olmasa cavab seçin!"
+      }
+    }
+  })
+  
+  # Sistem məlumatları
+  output$system_info <- renderText({
+    paste(
+      "🖥️ Sistem Məlumatları:\n",
+      "• R versiyası:", R.version.string, "\n",
+      "• Shiny versiyası:", packageVersion("shiny"), "\n", 
+      "• Platform:", R.version$platform, "\n",
+      "• Yaddaş:", round(memory.size(max = TRUE), 1), "MB\n",
+      "• İşləmə müddəti:", round(as.numeric(Sys.time() - .POSIXct(Sys.Date())), 1), "saat\n",
+      "• Status: 🟢 Aktiv"
+    )
+  })
+  
+}
+
+# Tətbiqi işə sal
+shinyApp(ui = ui, server = server)
