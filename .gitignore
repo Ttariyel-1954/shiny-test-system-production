@@ -22,3 +22,4 @@ Thumbs.db
 # Docker volumes data
 postgres_data/
 shiny_logs/
+.Rproj.user

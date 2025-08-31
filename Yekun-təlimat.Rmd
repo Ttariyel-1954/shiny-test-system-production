@@ -1,0 +1,775 @@
+
+---
+title: "Tam-təlimat"
+author: "T.Tariyel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+<style type="text/css">
+  body{
+  font-size: 20pt;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Docker və Containerization - Hərtərəfli Öyrənmə Bələdçisi
+
+## Giriş: Nə etdik və Niyə?
+
+Bu layihədə bir Shiny R tətbiqini Docker container-inə çevirib 20 şəbəkədə 600 istifadəçi üçün deploy etməyə hazırladıq. Bu prosesin hər mərhələsini detallı şəkildə izah edəcəyəm.
+
+---
+
+## Bölüm 1: Docker Konseptləri və Terminologiya
+
+### 1.1 Docker Nədir?
+
+Docker bir "containerization" platformasıdır. Bunu başa düşmək üçün analoji düşünün:
+
+**Köhnə üsul (Virtual Machine):**
+- Kompüterinizin içində tam ayrı bir kompüter yaratmaq
+- Hər VM-də ayrı əməliyyat sistemi
+- Çox yaddaş və CPU istifadəsi
+
+**Docker üsulu (Container):**
+- Tətbiqi və onun bütün tələblərini bir "qutu"ya qoyub
+- Host əməliyyat sistemini paylaşır
+- Daha az resurs istifadəsi
+- Daha sürətli başlanğıc
+
+### 1.2 Əsas Terminlər
+
+**Image (Görüntü):**
+- Tətbiqin "şablon"u
+- Dəyişməz (immutable)
+- Dockerfile-dan yaranır
+
+**Container (Konteyner):**
+- Image-in işlək versiyası
+- Process kimi işləyir
+- Yaradıla, dayandırıla, silinə bilər
+
+**Dockerfile:**
+- Image necə yaradılacağının təlimatları
+- Təbəqə-təbəqə qurulma addımları
+
+**Docker Compose:**
+- Çox-konteynerli tətbiqləri idarə etmək
+- Servislər arası əlaqəni təmin etmək
+
+---
+
+## Bölüm 2: Layihəmizin Arxitekturası
+
+### 2.1 Bizim Sistemin Komponentləri
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Nginx Proxy   │    │   Shiny Server   │    │   PostgreSQL    │
+│   Port: 80      │───▶│   Port: 3838     │───▶│   Port: 5432    │
+│   Load Balancer │    │   R Application  │    │   Database      │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+```
+
+**Nginx (Ön cəbhə):**
+- İstifadəçi trafiki qəbul edir
+- Shiny tətbiqinə yönləndirir
+- SSL/HTTPS dəstəyi
+- Load balancing (yük paylama)
+
+**Shiny Server (Tətbiq):**
+- R tətbiqini işə salır
+- İstifadəçi interface-ini təmin edir
+- Database ilə əlaqə qurur
+
+**PostgreSQL (Verilənlər bazası):**
+- Test sualları saxlanır
+- İstifadəçi cavabları saxlanır
+- Session məlumatları
+
+### 2.2 Niyə Bu Arxitekturanı Seçdik?
+
+1. **Scalability (Genişlənmə):** Hər komponent müstəqil ölçüləndə bilər
+2. **Reliability (Etibarlılıq):** Bir komponent işləməsə, digərləri işləyir
+3. **Security (Təhlükəsizlik):** Hər komponent öz mühitində təcrid edilir
+4. **Maintenance (Təmir):** Hər komponent ayrı-ayrı yenilənə bilər
+
+---
+
+## Bölüm 3: Dockerfile Yaratma Prosesi
+
+### 3.1 Dockerfile Nədir?
+
+Dockerfile tətbiqin necə qurulacağının "resepti"dir. Hər sətir ayrı bir təbəqə yaradır.
+
+### 3.2 Bizim Dockerfile Analizi
+
+```dockerfile
+FROM --platform=linux/amd64 rocker/shiny:4.3.1
+```
+**İzah:**
+- `FROM` - əsas image seçir
+- `rocker/shiny:4.3.1` - R və Shiny quraşdırılmış image
+- `--platform=linux/amd64` - Mac M-chip problemini həll edir
+
+```dockerfile
+RUN apt-get update && apt-get install -y \
+    libcurl4-openssl-dev \
+    libxml2-dev \
+    libssl-dev \
+    libsqlite3-dev \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+```
+**İzah:**
+- `RUN` - container daxilində əmr icra edir
+- `apt-get update` - paket siyahısını yeniləyir
+- `apt-get install -y` - lazım olan kitabxanaları quraşdırır
+- `libcurl4-openssl-dev` - HTTP əlaqələr üçün
+- `libxml2-dev` - XML işləmə üçün
+- `rm -rf /var/lib/apt/lists/*` - cache-i təmizləyir (image ölçüsünü azaldır)
+
+```dockerfile
+RUN R -e "install.packages('shiny', repos='https://cran.rstudio.com/')"
+RUN R -e "install.packages('DBI', repos='https://cran.rstudio.com/')"
+```
+**İzah:**
+- Hər R paketi ayrı RUN əmrində
+- Docker cache mexanizmini optimallaşdırır
+- Bir paket xəta versə, digərləri cache-dən alınır
+
+```dockerfile
+COPY app.R /srv/shiny-server/
+```
+**İzah:**
+- Host sistemdən container-ə fayl köçürür
+- `/srv/shiny-server/` - Shiny Server-in default qovluğu
+
+```dockerfile
+EXPOSE 3838
+```
+**İzah:**
+- Konteyner bu portda dinləyəcəyini bildirir
+- Actual port mapping docker run zamanı olur
+
+### 3.3 Dockerfile Best Practices
+
+1. **Təbəqələri minimize edin:** Çox RUN əmri image-i böyüdür
+2. **Cache-i optimallaşdırın:** Daha az dəyişən şeylər üstdə
+3. **Security:** Root istifadəçi kimi işləməyin
+4. **Cleanup:** Hər RUN əmrindən sonra temp faylları silin
+
+---
+
+## Bölüm 4: Docker Compose Dərinliklər
+
+### 4.1 Docker Compose Niyə Lazım?
+
+Çox-konteynerli tətbiqlər üçün:
+- Bir əmrlə bütün konteynerları idarə etmək
+- Konteyner arası networking
+- Environment variable paylaşımı
+- Volume (data persistence) idarəsi
+
+### 4.2 Bizim docker-compose.yml Analizi
+
+```yaml
+version: '3.8'
+```
+**İzah:** Compose fayl formatının versiyası
+
+```yaml
+services:
+  postgres:
+    image: postgres:15
+    container_name: test-postgres
+```
+**İzah:**
+- `services` - bütün konteynerlərin tərifləri
+- `postgres` - servis adı (internal network-də host adı)
+- `image` - hazır image istifadə edir (build etmir)
+- `container_name` - konteynerin adı
+
+```yaml
+    environment:
+      POSTGRES_DB: test_database
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass123
+```
+**İzah:**
+- Container daxilində environment variable-lar
+- PostgreSQL avtomatik olaraq bu məlumatlarla quruluş edir
+
+```yaml
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+```
+**İzah:**
+- Data persistence üçün
+- Konteyner silinsə də data qalır
+- `postgres_data` - named volume
+
+```yaml
+    networks:
+      - test-network
+```
+**İzah:**
+- Konteynerlərin xüsusi network-də olması
+- Bu network-dəki konteynerler bir-birini görür
+
+```yaml
+  shiny-app:
+    build: .
+    depends_on:
+      - postgres
+```
+**İzah:**
+- `build: .` - hazırkı qovluqdakı Dockerfile ilə image yaradır
+- `depends_on` - postgres əvvəl başlamalıdır
+
+### 4.3 Networking Açıqlaması
+
+Docker Compose avtomatik olaraq:
+1. Xüsusi bridge network yaradır
+2. Bütün konteynerləri bu network-ə qoşur
+3. Servis adları ilə DNS resolution təmin edir
+
+Məsələn: `shiny-app` konteyneri `postgres` adı ilə database-ə çata bilir.
+
+---
+
+## Bölüm 5: Container Lifecycle və İdarəetmə
+
+### 5.1 Konteyner Həyat Dövrü
+
+```
+Build → Create → Start → Run → Stop → Remove
+   ↓        ↓       ↓      ↓      ↓       ↓
+Image → Container → Running → Stopped → Deleted
+```
+
+### 5.2 Docker Əmrləri və Məqsədləri
+
+**Image əmrləri:**
+```bash
+docker build -t image_name .          # Image yaradır
+docker images                         # Image siyahısı
+docker rmi image_name                 # Image silir
+docker pull image_name               # Hub-dan image çəkir
+docker push image_name               # Hub-a image göndərir
+```
+
+**Container əmrləri:**
+```bash
+docker run image_name                # Container yaradıb başladır
+docker ps                           # İşləyən konteynerləri göstərir
+docker ps -a                        # Bütün konteynerləri göstərir
+docker stop container_name          # Konteyner dayandırır
+docker start container_name         # Dayandırılmış konteyner başladır
+docker rm container_name            # Konteyner silir
+```
+
+**Docker Compose əmrləri:**
+```bash
+docker compose up                   # Bütün servislər başladır
+docker compose up -d                # Background-da başladır
+docker compose down                 # Bütün servislər dayandırır və silir
+docker compose ps                   # Servis statusları
+docker compose logs service_name    # Servis logları
+docker compose build               # Image-ləri yenidən yaradır
+```
+
+### 5.3 Volume və Data Persistence
+
+**Volume növləri:**
+1. **Named volumes:** Docker idarə edir
+2. **Bind mounts:** Host qovluğunu mount edir
+3. **tmpfs mounts:** Memory-də müvəqqəti data
+
+**Bizim istifadəmiz:**
+```yaml
+volumes:
+  - postgres_data:/var/lib/postgresql/data  # Named volume
+  - ./app.R:/srv/shiny-server/app.R        # Bind mount
+```
+
+---
+
+## Bölüm 6: Git və GitHub Integration
+
+### 6.1 Git Version Control Konsepti
+
+Git paylanmış versiya nəzarət sistemidir:
+- Kod dəyişikliklərini izləyir
+- Multiple developer-in birgə işini təmin edir
+- Backup və history saxlayır
+
+### 6.2 Git İş Axını
+
+```
+Working Directory → Staging Area → Local Repository → Remote Repository
+     (edit)         (git add)       (git commit)      (git push)
+```
+
+**Bizim prosesimiz:**
+```bash
+git init                    # Repository yaradır
+git add .                   # Bütün faylları staging area-ya əlavə edir
+git commit -m "message"     # Local repository-yə saxlayır
+git push origin main        # GitHub-a göndərir
+```
+
+### 6.3 GitHub Personal Access Token
+
+GitHub 2021-dən parol authentication-ı dayandırıb. İndi token lazımdır:
+
+**Token yaratma səbəbləri:**
+1. **Security:** Paroldan daha təhlükəsiz
+2. **Granular permissions:** Məhdud icazələr
+3. **Revocable:** İstər vaxt silinə bilər
+
+**Token scope-ları:**
+- `repo` - Repository-lərə tam giriş
+- `workflow` - GitHub Actions-a giriş
+- `write:packages` - Package-lərə yazma icazəsi
+
+---
+
+## Bölüm 7: Production Deployment Strategy
+
+### 7.1 Development vs Production
+
+**Development environment:**
+- Hot reload (kod dəyişərsə avtomatik yenilənir)
+- Debug logları
+- Development database
+- Security check-lər yüngül
+
+**Production environment:**
+- Stability üçün optimize edilib
+- Minimal loglar
+- Production database
+- Güclü security
+- Performance tuning
+
+### 7.2 Bizim Production Strategy-si
+
+```yaml
+# Production docker-compose.yml
+services:
+  shiny-app:
+    build:
+      context: https://github.com/Ttariyel-1954/shiny-test-system-production.git
+    container_name: prod-shiny-app
+    ports:
+      - "8080:3838"  # Host port 8080
+    environment:
+      - APP_ENV=production
+    restart: unless-stopped  # Avtomatik yenidən başlama
+```
+
+**Key production features:**
+- `restart: unless-stopped` - Sistem reboot olsa da avtomatik başlayır
+- Environment variables ilə konfiqurasiya
+- GitHub repository-dən birbaşa build
+- Ayrı portlar (konflikt qarşısını alır)
+
+### 7.3 Multi-Server Deployment
+
+20 şəbəkədə deployment üçün strategiya:
+
+**1. Centralized Image Distribution:**
+```bash
+# Master server-də
+docker build -t shiny-app:v1.0 .
+docker save shiny-app:v1.0 > shiny-app.tar
+
+# Digər server-lərdə  
+docker load < shiny-app.tar
+```
+
+**2. Git-based Deployment:**
+```bash
+# Hər server-də
+git clone https://github.com/username/repo.git
+docker compose up -d
+```
+
+**3. Registry-based (Docker Hub):**
+```bash
+# Push once
+docker push username/shiny-app:v1.0
+
+# Pull everywhere
+docker pull username/shiny-app:v1.0
+```
+
+---
+
+## Bölüm 8: Performance və Scalability
+
+### 8.1 Container Resource Management
+
+**CPU limits:**
+```yaml
+services:
+  shiny-app:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+```
+
+**PostgreSQL tuning:**
+```yaml
+postgres:
+  command: postgres -c max_connections=600 -c shared_buffers=256MB
+```
+
+### 8.2 Horizontal Scaling
+
+**Load balancer ilə multiple Shiny instances:**
+```yaml
+services:
+  shiny-app-1:
+    build: .
+    ports: ["3838"]
+  shiny-app-2:  
+    build: .
+    ports: ["3838"]
+  nginx:
+    image: nginx
+    depends_on: [shiny-app-1, shiny-app-2]
+```
+
+### 8.3 Monitoring və Logging
+
+**Log aggregation:**
+```yaml
+services:
+  shiny-app:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+**Health checks:**
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:3838"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+---
+
+## Bölüm 9: Security Best Practices
+
+### 9.1 Container Security
+
+**1. Non-root user:**
+```dockerfile
+RUN groupadd -r shinyuser && useradd -r -g shinyuser shinyuser
+USER shinyuser
+```
+
+**2. Minimal base image:**
+```dockerfile
+FROM alpine:3.14  # Minimal Linux distribution
+```
+
+**3. Secrets management:**
+```yaml
+services:
+  app:
+    environment:
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+    secrets:
+      - db_password
+```
+
+### 9.2 Network Security
+
+**Internal networks:**
+```yaml
+networks:
+  frontend:
+    external: true
+  backend:
+    internal: true  # İnternet girişi yoxdur
+```
+
+**Port exposure minimization:**
+```yaml
+services:
+  database:
+    ports: []  # Heç bir port expose etmir
+```
+
+### 9.3 Data Security
+
+**Encrypted volumes:**
+```bash
+docker volume create --driver local \
+    --opt type=tmpfs \
+    --opt device=tmpfs \
+    --opt o=size=100m,uid=1000 \
+    encrypted_volume
+```
+
+---
+
+## Bölüm 10: Troubleshooting və Debug
+
+### 10.1 Ümumi Problemlər və Həlləri
+
+**Port conflicts:**
+```bash
+# Problem: Port 5432 artıq istifadədədir
+Error: bind: address already in use
+
+# Həll: Fərqli port istifadə edin
+ports:
+  - "5433:5432"
+```
+
+**Platform architecture mismatches:**
+```bash
+# Problem: ARM64 vs AMD64
+WARNING: The requested image's platform (linux/amd64) 
+does not match the detected host platform (linux/arm64/v8)
+
+# Həll: Platform specify edin
+FROM --platform=linux/arm64 ubuntu:20.04
+```
+
+**Memory issues:**
+```bash
+# Container memory istifadəsini yoxlayın
+docker stats --no-stream
+
+# Memory limit qoyun
+services:
+  app:
+    mem_limit: 2g
+```
+
+### 10.2 Log Analysis
+
+**Container logları:**
+```bash
+# Real-time logs
+docker logs -f container_name
+
+# Son 100 sətir
+docker logs --tail=100 container_name
+
+# Specific time range
+docker logs --since="2023-08-30T10:00:00" container_name
+```
+
+**Application-level debugging:**
+```dockerfile
+# Development mode
+ENV SHINY_LOG_STDERR=1
+ENV R_SHINY_PORT=3838
+ENV SHINY_LOG_LEVEL=TRACE
+```
+
+### 10.3 Performance Debugging
+
+**Resource monitoring:**
+```bash
+# Container resource istifadəsi
+docker exec container_name top
+
+# Disk istifadəsi  
+docker exec container_name df -h
+
+# Network connections
+docker exec container_name netstat -tulnp
+```
+
+---
+
+## Bölüm 11: Advanced Docker Features
+
+### 11.1 Multi-stage Builds
+
+```dockerfile
+# Build stage
+FROM node:16 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+# Production stage  
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+```
+
+**Faydalar:**
+- Image ölçüsü kiçik olur
+- Build dependencies production-a daxil olmur
+- Security artır
+
+### 11.2 Docker Secrets
+
+```yaml
+services:
+  db:
+    image: postgres
+    secrets:
+      - db_password
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+
+secrets:
+  db_password:
+    file: ./db_password.txt
+```
+
+### 11.3 Custom Networks
+
+```yaml
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  backend:
+    driver: bridge
+    internal: true
+```
+
+---
+
+## Bölüm 12: CI/CD Integration
+
+### 12.1 GitHub Actions ilə Automated Deployment
+
+```yaml
+name: Build and Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Build Docker image
+      run: docker build -t myapp:${{ github.sha }} .
+    - name: Deploy to production
+      run: |
+        docker tag myapp:${{ github.sha }} myapp:latest
+        docker push myapp:latest
+```
+
+### 12.2 Automated Testing
+
+```dockerfile
+# Test stage
+FROM myapp:base AS test
+RUN npm test
+RUN npm run lint
+
+# Production stage  
+FROM myapp:base AS production
+COPY . .
+```
+
+---
+
+## Bölüm 13: Real-world Production Patterns
+
+### 13.1 Blue-Green Deployment
+
+```bash
+# Blue (cari production)
+docker compose -f docker-compose.blue.yml up -d
+
+# Green (yeni version)
+docker compose -f docker-compose.green.yml up -d
+
+# Switch traffic (nginx config update)
+# Blue environment-i dayandır
+```
+
+### 13.2 Rolling Updates
+
+```yaml
+services:
+  app:
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 30s
+        failure_action: rollback
+```
+
+### 13.3 Database Migration Strategies
+
+```bash
+# Migration container
+docker run --network=app_network \
+  --rm migration-tool \
+  migrate -database postgres://... -path ./migrations up
+```
+
+---
+
+## Xülasə: Layihədən Çıxarılan Dərslər
+
+### Texniki Dərslər:
+
+1. **Containerization Benefits:**
+   - Consistency across environments
+   - Easy scaling və deployment  
+   - Resource isolation və security
+
+2. **Multi-container Architecture:**
+   - Service separation və maintainability
+   - Independent scaling və updates
+   - Fault tolerance
+
+3. **DevOps Integration:**
+   - Version control ilə infrastructure as code
+   - Automated deployment pipelines
+   - Monitoring və logging centralization
+
+### Best Practices Qeydlər:
+
+1. **Always use explicit versions** (rocker/shiny:4.3.1 vs latest)
+2. **Minimize image layers** (combine RUN statements)
+3. **Use .dockerignore** (exclude unnecessary files)
+4. **Health checks are crucial** (container durumu monitoring)
+5. **Resource limits prevent system overload**
+6. **Secrets should never be in Dockerfiles**
+
+### Gələcək İnkişaf İstiqamətləri:
+
+1. **Kubernetes orchestration** (production scalability üçün)
+2. **Service mesh integration** (microservices communication)
+3. **Advanced monitoring** (Prometheus, Grafana)
+4. **Automated backup strategies**
+5. **Multi-region deployment**
+
+Bu layihə modern software development və deployment practice-lərinin praktiki nümunəsidir. Container technology, version control, və automated deployment-in kombinasiyası reliable və scalable sistem yaratmağa imkan verir.
