@@ -1,45 +1,157 @@
 
-# SQLite ilə Təhsil Test Sistemi
 library(shiny)
 library(DBI)
 library(RSQLite)
 library(shinydashboard)
 library(DT)
+library(RPostgreSQL)
+library(jsonlite)
 
-# SQLite verilənlər bazası faylı
-DB_FILE <- "education_test.db"
+# Veritabanı konfiqurasiyası - hibrid sistem
+DB_CONFIG <- list(
+  primary = "postgresql",
+  fallback = "sqlite", 
+  sqlite_file = "education_test.db",
+  # Heroku environment variables
+  pg_host = Sys.getenv("DATABASE_HOST", "localhost"),
+  pg_port = as.numeric(Sys.getenv("DATABASE_PORT", "5432")),
+  pg_dbname = Sys.getenv("DATABASE_NAME", "education_db"),
+  pg_user = Sys.getenv("DATABASE_USER", "postgres"),
+  pg_password = Sys.getenv("DATABASE_PASSWORD", "")
+)
 
-# Verilənlər bazası bağlantısı
-get_db_connection <- function() {
+# Debug info
+cat("DB konfiqurasiyası yükləndi - Host:", DB_CONFIG$pg_host, "\n")
+
+# Hibrid veritabanı bağlantısı - əvvəl PostgreSQL, sonra SQLite
+get_db_connection <- function(force_sqlite = FALSE, timeout = 5) {
+  if(!force_sqlite) {
+    # PostgreSQL-a cəhd et
+    tryCatch({
+      # Connection timeout ilə
+      # Müxtəlif authentication metodları ilə cəhd et
+      con <- tryCatch({
+        # Əvvəl Heroku URL formatını yoxla
+        database_url <- Sys.getenv("DATABASE_URL", "")
+        if(database_url != "") {
+          # Heroku PostgreSQL URL formatı
+          dbConnect(RPostgreSQL::PostgreSQL(), 
+                    dbname = database_url)
+        } else {
+          # Adi parametrlər
+          dbConnect(RPostgreSQL::PostgreSQL(),
+                    host = DB_CONFIG$pg_host,
+                    port = DB_CONFIG$pg_port,
+                    dbname = DB_CONFIG$pg_dbname,
+                    user = DB_CONFIG$pg_user,
+                    password = DB_CONFIG$pg_password)
+        }
+      }, error = function(e) {
+        cat("PostgreSQL bağlantı uğursuz:", e$message, "\n")
+        return(NULL)
+      })
+      
+      if(is.null(con)) {
+        stop("PostgreSQL bağlantısı alınmadı")
+      }
+      
+      # Bağlantını sürətlə test et
+      test_result <- dbGetQuery(con, "SELECT 1 as test_connection LIMIT 1")
+      
+      if(nrow(test_result) == 1) {
+        attr(con, "db_type") <- "postgresql"
+        cat("PostgreSQL bağlantısı uğurlu\n")
+        return(con)
+      } else {
+        dbDisconnect(con)
+      }
+      
+    }, error = function(e) {
+      cat("PostgreSQL xətası:", e$message, "\n")
+    })
+  }
+  
+  # SQLite fallback
   tryCatch({
-    con <- dbConnect(RSQLite::SQLite(), DB_FILE)
+    con <- dbConnect(RSQLite::SQLite(), DB_CONFIG$sqlite_file)
+    attr(con, "db_type") <- "sqlite"
+    #cat("SQLite bağlantısı istifadə olunur\n")
     return(con)
   }, error = function(e) {
+    cat("SQLite xətası:", e$message, "\n")
     return(NULL)
   })
 }
 
-# Verilənlər bazası cədvəllərini yaratmaq funksiyası
-create_database_tables <- function() {
+# Veritabanı tipini yoxla
+get_current_db_type <- function() {
   con <- get_db_connection()
-  if(is.null(con)) return(FALSE)
+  if(is.null(con)) return("none")
   
-  tryCatch({
+  db_type <- attr(con, "db_type")
+  dbDisconnect(con)
+  return(db_type)
+}
+
+# Retry ilə veritabanı əməliyyatı
+db_operation_with_retry <- function(operation_func, max_retries = 3) {
+  for(attempt in 1:max_retries) {
+    tryCatch({
+      con <- get_db_connection()
+      if(is.null(con)) {
+        if(attempt == max_retries) {
+          #cat("DB bağlantısı uğursuz, bütün cəhdlər tükəndi\n")
+          return(NULL)
+        }
+        Sys.sleep(attempt)  # 1, 2, 3 saniyə gözlə
+        next
+      }
+      
+      result <- operation_func(con)
+      dbDisconnect(con)
+      return(result)
+      
+    }, error = function(e) {
+      if(exists("con") && !is.null(con)) {
+        tryCatch(dbDisconnect(con), error = function(e2) {})
+      }
+      
+      #cat("DB əməliyyat xətası (cəhd", attempt, "):", e$message, "\n")
+      
+      if(attempt == max_retries) {
+        return(NULL)
+      }
+      
+      Sys.sleep(attempt)
+    })
+  }
+}
+
+# Hibrid veritabanı cədvəllərini yaratmaq funksiyası
+create_database_tables <- function() {
+  return(db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    #cat("Cədvəllər yaradılır - DB tipi:", db_type, "\n")
+    
+    # PostgreSQL və SQLite üçün fərqli AUTO_INCREMENT sintaksisi
+    auto_increment <- if(db_type == "postgresql") "SERIAL PRIMARY KEY" else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    timestamp_default <- if(db_type == "postgresql") "TIMESTAMP DEFAULT NOW()" else "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    
     # Fənnlər cədvəli
-    dbExecute(con, "
+    dbExecute(con, paste0("
       CREATE TABLE IF NOT EXISTS subjects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id ", auto_increment, ",
         subject_name TEXT NOT NULL,
         subject_code TEXT NOT NULL,
         description TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at ", timestamp_default, "
       )
-    ")
+    "))
     
     # Suallar cədvəli
-    dbExecute(con, "
+    dbExecute(con, paste0("
       CREATE TABLE IF NOT EXISTS questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id ", auto_increment, ",
         subject_id INTEGER,
         question_text TEXT NOT NULL,
         option_a TEXT NOT NULL,
@@ -48,26 +160,25 @@ create_database_tables <- function() {
         option_d TEXT NOT NULL,
         correct_answer TEXT NOT NULL,
         difficulty_level INTEGER DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (subject_id) REFERENCES subjects(id)
+        created_at ", timestamp_default, "
       )
-    ")
+    "))
     
     # Məktəblər cədvəli
-    dbExecute(con, "
+    dbExecute(con, paste0("
       CREATE TABLE IF NOT EXISTS schools (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id ", auto_increment, ",
         school_name TEXT NOT NULL,
         city TEXT,
         region TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at ", timestamp_default, "
       )
-    ")
+    "))
     
     # Test nəticələri cədvəli
-    dbExecute(con, "
+    dbExecute(con, paste0("
       CREATE TABLE IF NOT EXISTS test_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id ", auto_increment, ",
         student_name TEXT NOT NULL,
         class_level INTEGER NOT NULL,
         school_id INTEGER,
@@ -78,32 +189,29 @@ create_database_tables <- function() {
         percentage REAL,
         duration_seconds INTEGER,
         answers TEXT,
-        test_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (school_id) REFERENCES schools(id),
-        FOREIGN KEY (subject_id) REFERENCES subjects(id)
+        test_date ", timestamp_default, "
       )
-    ")
+    "))
     
-    dbDisconnect(con)
+    cat("Cədvəllər uğurla yaradıldı -", db_type, "\n")
     return(TRUE)
-  }, error = function(e) {
-    if(!is.null(con)) dbDisconnect(con)
-    return(FALSE)
-  })
+  }))
 }
 
 # Nümunə məlumatları əlavə etmək
+# Hibrid sistem üçün nümunə məlumatları
 insert_sample_data <- function() {
-  con <- get_db_connection()
-  if(is.null(con)) return(FALSE)
-  
-  tryCatch({
+  return(db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    
     # Məlumat varmı yoxla
     existing <- dbGetQuery(con, "SELECT COUNT(*) as count FROM subjects")
     if(existing$count > 0) {
-      dbDisconnect(con)
+      cat("Nümunə məlumatlar artıq mövcuddur -", db_type, "\n")
       return(TRUE)
     }
+    
+    cat("Nümunə məlumatlar əlavə edilir -", db_type, "\n")
     
     # Fənnləri əlavə et
     subjects_data <- data.frame(
@@ -115,10 +223,16 @@ insert_sample_data <- function() {
                       "Kimyəvi elementlər və reaksiyalar", "Canlılar aləmi haqqında",
                       "Azərbaycan və dünya tarixi", "Dünya coğrafiyası və təbiət",
                       "Azərbaycan ədəbiyyatı", "İngilis dili qrammatikası",
-                      "Kompüter elmləri", "Fəlsəfə tarixi və məntiq")
+                      "Kompüter elmləri", "Fəlsəfə tarixi və məntiq"),
+      stringsAsFactors = FALSE
     )
     
-    dbWriteTable(con, "subjects", subjects_data, append = TRUE, row.names = FALSE)
+    # PostgreSQL və SQLite üçün fərqli yazma metodları
+    if(db_type == "postgresql") {
+      dbWriteTable(con, "subjects", subjects_data, append = TRUE, row.names = FALSE)
+    } else {
+      dbWriteTable(con, "subjects", subjects_data, append = TRUE, row.names = FALSE)
+    }
     
     # Məktəbləri əlavə et
     schools_data <- data.frame(
@@ -130,35 +244,22 @@ insert_sample_data <- function() {
       city = c("Bakı", "Gəncə", "Sumqayıt", "Şəki", "Lənkəran",
                "Şirvan", "Mingəçevir", "Naxçıvan", "Qəbələ", "Quba"),
       region = c("Bakı", "Gəncə-Qazax", "Abşeron", "Şəki-Zaqatala", "Lənkəran",
-                 "Şirvan", "Aran", "Naxçıvan", "Quba-Xaçmaz", "Quba-Xaçmaz")
+                 "Şirvan", "Aran", "Naxçıvan", "Quba-Xaçmaz", "Quba-Xaçmaz"),
+      stringsAsFactors = FALSE
     )
     
     dbWriteTable(con, "schools", schools_data, append = TRUE, row.names = FALSE)
     
-    # Riyaziyyat sualları
+    # Riyaziyyat sualları (əvvəlki kimidir)
     math_questions <- data.frame(
       subject_id = rep(1, 20),
       question_text = c(
-        "12 + 15 × 3 = ?",
-        "√64 = ?",
-        "2x + 5 = 17 olduqda x = ?",
-        "sin(30°) = ?",
-        "log₁₀(100) = ?",
-        "3! = ?",
-        "Dairənin sahəsi (r=5) = ?",
-        "2⁵ = ?",
-        "(-3)² = ?",
-        "15% -i 200-dən = ?",
-        "3x - 7 = 2x + 5 olduqda x = ?",
-        "cos(60°) = ?",
-        "5x + 3y = 15 və x = 0 olduqda y = ?",
-        "2/3 + 1/4 = ?",
-        "Kvadratın diaqonalı (tərəf=4) = ?",
-        "|(-5)| = ?",
-        "8 × (3 + 2) = ?",
-        "25 ÷ 5² = ?",
-        "x² = 16 olduqda x = ?",
-        "Trapesiyada orta xətt (a=6, b=4) = ?"
+        "12 + 15 × 3 = ?", "√64 = ?", "2x + 5 = 17 olduqda x = ?", "sin(30°) = ?",
+        "log₁₀(100) = ?", "3! = ?", "Dairənin sahəsi (r=5) = ?", "2⁵ = ?",
+        "(-3)² = ?", "15% -i 200-dən = ?", "3x - 7 = 2x + 5 olduqda x = ?",
+        "cos(60°) = ?", "5x + 3y = 15 və x = 0 olduqda y = ?", "2/3 + 1/4 = ?",
+        "Kvadratın diaqonalı (tərəf=4) = ?", "|(-5)| = ?", "8 × (3 + 2) = ?",
+        "25 ÷ 5² = ?", "x² = 16 olduqda x = ?", "Trapesiyada orta xətt (a=6, b=4) = ?"
       ),
       option_a = c("57", "6", "6", "0.5", "2", "6", "25π", "32", "9", "30", 
                    "12", "0.5", "5", "11/12", "4√2", "5", "40", "1", "±4", "5"),
@@ -170,28 +271,20 @@ insert_sample_data <- function() {
                    "5", "1", "0", "1/2", "6", "|5|", "35", "0.2", "16", "8"),
       correct_answer = c("A", "B", "A", "B", "A", "A", "B", "A", "A", "A",
                          "A", "B", "A", "A", "B", "A", "A", "A", "A", "A"),
-      difficulty_level = c(1,1,2,3,2,1,2,1,1,1,2,3,2,2,3,1,1,1,2,2)
+      difficulty_level = c(1,1,2,3,2,1,2,1,1,1,2,3,2,2,3,1,1,1,2,2),
+      stringsAsFactors = FALSE
     )
     
-    # Fizika sualları
+    # Digər fənn sualları da əlavə et (əvvəlki kimi)
     physics_questions <- data.frame(
       subject_id = rep(2, 15),
       question_text = c(
-        "Səs dalğalarının havadakı sürəti təxminən neçədir?",
-        "İşığın vakuumdakı sürəti = ?",
-        "F = ma düsturu kimə aiddir?",
-        "Elektrik enerjisinin ölçü vahidi nədir?",
-        "Arximed qanunu nə ilə bağlıdır?",
-        "Ohm qanunu: V = ?",
-        "Gravitasiya təcili Yer üzərində = ?",
-        "Elektrik yükünün ölçü vahidi = ?",
-        "Güc düsturu P = ?",
-        "Kinetik enerji Ek = ?",
-        "Dalğa uzunluğu və tezlik: λ × f = ?",
-        "Coulomb qanunu nə təsvir edir?",
-        "Termodinamikanın I qanunu nəyi ifadə edir?",
-        "Magnetik sahənin ölçü vahidi = ?",
-        "Planck sabiti h = ?"
+        "Səs dalğalarının havadakı sürəti təxminən neçədir?", "İşığın vakuumdakı sürəti = ?",
+        "F = ma düsturu kimə aiddir?", "Elektrik enerjisinin ölçü vahidi nədir?",
+        "Arximed qanunu nə ilə bağlıdır?", "Ohm qanunu: V = ?", "Gravitasiya təcili Yer üzərində = ?",
+        "Elektrik yükünün ölçü vahidi = ?", "Güc düsturu P = ?", "Kinetik enerji Ek = ?",
+        "Dalğa uzunluğu və tezlik: λ × f = ?", "Coulomb qanunu nə təsvir edir?",
+        "Termodinamikanın I qanunu nəyi ifadə edir?", "Magnetik sahənin ölçü vahidi = ?", "Planck sabiti h = ?"
       ),
       option_a = c("340 m/s", "3×10⁸ m/s", "Nyuton", "Vatt", "Üzmə", "IR", 
                    "9.8 m/s²", "Kulon", "W/t", "mv²/2", "v", "Elektrik qüvvə",
@@ -207,28 +300,18 @@ insert_sample_data <- function() {
                    "Zaman saxlanması", "Om", "2.99×10⁸ J·s"),
       correct_answer = c("A", "A", "A", "C", "A", "A", "A", "A", "C", "A",
                          "B", "A", "A", "A", "A"),
-      difficulty_level = c(1,2,1,2,1,2,1,1,2,2,3,3,3,2,3)
+      difficulty_level = c(1,2,1,2,1,2,1,1,2,2,3,3,3,2,3),
+      stringsAsFactors = FALSE
     )
     
-    # Kimya sualları
     chemistry_questions <- data.frame(
       subject_id = rep(3, 15),
       question_text = c(
-        "Suyun kimyəvi düsturu nədir?",
-        "Duz turşusunun düsturu = ?",
-        "Oksigenin atom nömrəsi = ?",
-        "Mendeleyev cədvəlində neçə element var?",
-        "pH = 7 nə deməkdir?",
-        "Karbonun valensliyi = ?",
-        "NaCl nədir?",
-        "Qızılın kimyəvi simvolu = ?",
-        "H₂SO₄ nədir?",
-        "Avogadro ədədi = ?",
-        "Benzolun düsturu C₆H₆ doğrudur?",
-        "Elektroliz nə prosesidir?",
-        "Kataliza nə deməkdir?",
-        "pH < 7 olan məhlul = ?",
-        "İon nədir?"
+        "Suyun kimyəvi düsturu nədir?", "Duz turşusunun düsturu = ?", "Oksigenin atom nömrəsi = ?",
+        "Mendeleyev cədvəlində neçə element var?", "pH = 7 nə deməkdir?", "Karbonun valensliyi = ?",
+        "NaCl nədir?", "Qızılın kimyəvi simvolu = ?", "H₂SO₄ nədir?", "Avogadro ədədi = ?",
+        "Benzolun düsturu C₆H₆ doğrudur?", "Elektroliz nə prosesidir?", "Kataliza nə deməkdir?",
+        "pH < 7 olan məhlul = ?", "İon nədir?"
       ),
       option_a = c("H2O", "HCl", "8", "118", "Neytral", "4", "Duz", "Au", 
                    "Sulfat turşu", "6.02×10²³", "Bəli", "Kimyəvi parçalanma",
@@ -244,66 +327,77 @@ insert_sample_data <- function() {
                    "Təzyiqi artırma", "Qarışıq", "Radikal"),
       correct_answer = c("A", "A", "A", "A", "A", "A", "A", "A", "A", "A",
                          "A", "C", "A", "A", "A"),
-      difficulty_level = c(1,1,1,2,2,2,1,1,1,3,2,3,2,2,2)
+      difficulty_level = c(1,1,1,2,2,2,1,1,1,3,2,3,2,2,2),
+      stringsAsFactors = FALSE
     )
     
-    # Sualları əlavə et
+    # Bütün sualları birləşdir və əlavə et
     all_questions <- rbind(math_questions, physics_questions, chemistry_questions)
-    dbWriteTable(con, "questions", all_questions, append = TRUE, row.names = FALSE)
     
-    dbDisconnect(con)
+    # PostgreSQL və SQLite üçün fərqli yazma metodları
+    if(db_type == "postgresql") {
+      dbWriteTable(con, "questions", all_questions, append = TRUE, row.names = FALSE)
+    } else {
+      dbWriteTable(con, "questions", all_questions, append = TRUE, row.names = FALSE)  
+    }
+    
+    cat("Nümunə məlumatlar uğurla əlavə edildi -", db_type, "\n")
     return(TRUE)
-  }, error = function(e) {
-    if(!is.null(con)) dbDisconnect(con)
-    return(FALSE)
-  })
+  }))
 }
 
-# Fənnləri gətir
+# Hibrid sistem üçün fənnləri gətir
 get_subjects <- function() {
-  con <- get_db_connection()
-  if(is.null(con)) return(data.frame())
-  
-  subjects <- dbGetQuery(con, "SELECT * FROM subjects ORDER BY subject_name")
-  dbDisconnect(con)
-  return(subjects)
-}
-
-# Məktəbləri gətir
-get_schools <- function() {
-  con <- get_db_connection()
-  if(is.null(con)) return(data.frame())
-  
-  schools <- dbGetQuery(con, "SELECT * FROM schools ORDER BY school_name")
-  dbDisconnect(con)
-  return(schools)
-}
-
-# Müəyyən fənn üzrə sualları gətir
-get_questions_by_subject <- function(subject_id, limit = 20) {
-  con <- get_db_connection()
-  if(is.null(con)) return(data.frame())
-  
-  query <- paste0("SELECT * FROM questions WHERE subject_id = ", subject_id,
-                  " ORDER BY RANDOM() LIMIT ", limit)
-  questions <- dbGetQuery(con, query)
-  dbDisconnect(con)
-  return(questions)
-}
-
-# Test nəticəsini saxla
-save_test_result <- function(result_data) {
-  con <- get_db_connection()
-  if(is.null(con)) return(FALSE)
-  
-  tryCatch({
-    dbWriteTable(con, "test_results", result_data, append = TRUE, row.names = FALSE)
-    dbDisconnect(con)
-    return(TRUE)
-  }, error = function(e) {
-    if(!is.null(con)) dbDisconnect(con)
-    return(FALSE)
+  result <- db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    subjects <- dbGetQuery(con, "SELECT * FROM subjects ORDER BY subject_name")
+    cat("Fənnlər alındı -", db_type, "- sayı:", nrow(subjects), "\n")
+    return(subjects)
   })
+  
+  return(if(is.null(result)) data.frame() else result)
+}
+
+# Hibrid sistem üçün məktəbləri gətir  
+get_schools <- function() {
+  result <- db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    schools <- dbGetQuery(con, "SELECT * FROM schools ORDER BY school_name")
+    cat("Məktəblər alındı -", db_type, "- sayı:", nrow(schools), "\n")
+    return(schools)
+  })
+  
+  return(if(is.null(result)) data.frame() else result)
+}
+
+# Hibrid sistem üçün sualları gətir
+get_questions_by_subject <- function(subject_id, limit = 20) {
+  result <- db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    
+    # PostgreSQL və SQLite üçün fərqli RANDOM sintaksisi
+    random_func <- if(db_type == "postgresql") "RANDOM()" else "RANDOM()"
+    
+    query <- paste0("SELECT * FROM questions WHERE subject_id = ", subject_id,
+                    " ORDER BY ", random_func, " LIMIT ", limit)
+    questions <- dbGetQuery(con, query)
+    cat("Suallar alındı -", db_type, "- sayı:", nrow(questions), "\n")
+    return(questions)
+  })
+  
+  return(if(is.null(result)) data.frame() else result)
+}
+
+# Hibrid sistem üçün nəticəni saxla
+save_test_result <- function(result_data) {
+  result <- db_operation_with_retry(function(con) {
+    db_type <- attr(con, "db_type")
+    dbWriteTable(con, "test_results", result_data, append = TRUE, row.names = FALSE)
+    cat("Test nəticəsi saxlanıldı -", db_type, "\n")
+    return(TRUE)
+  })
+  
+  return(!is.null(result) && result)
 }
 
 # UI
@@ -412,6 +506,13 @@ ui <- dashboardPage(
                                         style = "width: 100%;")
                        ),
                        
+                       br(), br(),
+                       
+                       # Veritabanı statusu
+                       div(style = "background: #e9ecef; padding: 10px; border-radius: 5px; text-align: center;",
+                           h6("Veritabanı Statusu:", style = "margin: 0;"),
+                           textOutput("db_status", inline = TRUE)
+                       ),
                        # Timer
                        conditionalPanel(
                          condition = "output.show_timer == true",
@@ -558,53 +659,75 @@ server <- function(input, output, session) {
   observeEvent(once = TRUE, eventExpr = TRUE, {
     showNotification("Sistem hazırdır!", type = "message", duration = 3)
   })
-  
-  # Verilənlər bazasını hazırla
-  observeEvent(input$init_db, {
-    showNotification("Verilənlər bazası yenilənir...", type = "message")
+  # Veritabanı statusunu göstər
+  output$db_status <- renderText({
+    db_type <- get_current_db_type()
+    status_text <- switch(db_type,
+                          "postgresql" = "PostgreSQL Aktiv",
+                          "sqlite" = "SQLite Aktiv (Fallback)",
+                          "none" = "Bağlantı Yoxdur"
+    )
     
-    if(create_database_tables()) {
-      if(insert_sample_data()) {
-        showNotification("Verilənlər bazası uğurla yeniləndi!", type = "message")
+    return(status_text)
+  })
+  # Verilənlər bazasını hazırla
+  # Hibrid veritabanı hazırlığı
+  observeEvent(input$init_db, {
+    db_type <- get_current_db_type()
+    showNotification(paste("Veritabanı hazırlanır -", db_type, "..."), type = "message")
+    
+    # Cədvəlləri yarat
+    tables_created <- create_database_tables()
+    
+    if(!is.null(tables_created) && tables_created) {
+      # Nümunə məlumatları əlavə et
+      data_inserted <- insert_sample_data()
+      
+      if(!is.null(data_inserted) && data_inserted) {
+        showNotification(paste("Veritabanı hazır -", db_type, "istifadə olunur!"), 
+                         type = "message", duration = 5)
         
-        # PostgreSQL seçimləri yenilə
+        # UI seçimlərini yenilə
         subjects <- get_subjects()
         schools <- get_schools()
         
-        if(nrow(subjects) > 0) {
+        if(!is.null(subjects) && nrow(subjects) > 0) {
           choices <- setNames(subjects$id, subjects$subject_name)
           updateSelectInput(session, "subject", choices = c("Seçin" = "", choices))
         }
         
-        if(nrow(schools) > 0) {
+        if(!is.null(schools) && nrow(schools) > 0) {
           choices <- setNames(schools$id, schools$school_name)
           updateSelectInput(session, "school", choices = c("Seçin" = "", choices))
         }
+        
       } else {
-        showNotification("Nümunə məlumatları əlavə edilmədi!", type = "error")
+        showNotification("Nümunə məlumatları əlavə edilmədi, amma sistem işləyir", 
+                         type = "warning")
       }
     } else {
-      showNotification("Verilənlər bazası yaradıla bilmədi!", type = "error")
+      showNotification("Veritabanı xətası - sistem fallback rejimdə işləyəcək", 
+                       type = "error")
     }
-  })
-  
+  })  # BU BAĞLAMA MÖTƏRIZƏ ƏLAVƏ EDİLMƏLİDİR!
+
   # Test başlat
   observeEvent(input$start, {
     # Validasiya
     if(is.null(input$name) || input$name == "") {
-      showNotification("Adınızı və soyadınızı yazın!", type = "error")
+      showNotification("Adınızı və soyadınızı yazın!", type = "message")
       return()
     }
     if(is.null(input$class) || input$class == "") {
-      showNotification("Sinifinizi seçin!", type = "error")
+      showNotification("Sinifinizi seçin!", type = "message")
       return()
     }
     if(is.null(input$school) || input$school == "") {
-      showNotification("Məktəbinizi seçin!", type = "error")
+      showNotification("Məktəbinizi seçin!", type = "message")
       return()
     }
     if(is.null(input$subject) || input$subject == "") {
-      showNotification("Fənni seçin!", type = "error")
+      showNotification("Fənni seçin!", type = "message")
       return()
     }
     
@@ -702,7 +825,7 @@ server <- function(input, output, session) {
           stringsAsFactors = FALSE
         )
       }
-      showNotification("PostgreSQL bağlantısı yoxdur, nümunə suallarla test davam edir", type = "warning")
+      showNotification("PostgreSQL bağlantısı yoxdur, nümunə suallarla test davam edir", type = "message")
     }
     
     # Test parametrlərini təyin et
@@ -760,7 +883,7 @@ server <- function(input, output, session) {
         
         if(vals$time_remaining <= 0) {
           finish_test()
-          showNotification("Vaxt bitdi! Test avtomatik olaraq tamamlandı.", type = "warning")
+          showNotification("Vaxt bitdi! Test avtomatik olaraq tamamlandı.", type = "message")
         }
       })
     }
@@ -898,7 +1021,7 @@ server <- function(input, output, session) {
     if(save_success) {
       showNotification("Nəticəniz uğurla saxlanıldı!", type = "message")
     } else {
-      showNotification("Nəticə saxlanmadı (PostgreSQL bağlantısı yoxdur), amma test bitdi.", type = "warning")
+      showNotification("Nəticə saxlanmadı (PostgreSQL bağlantısı yoxdur), amma test bitdi.", type = "message")
     }
     
     vals$finished <- TRUE
@@ -973,164 +1096,146 @@ server <- function(input, output, session) {
   })
   
   # Nəticələr cədvəli
+  # Hibrid nəticələr cədvəli
   output$all_results <- DT::renderDataTable({
-    con <- get_db_connection()
-    if(is.null(con)) {
-      return(DT::datatable(
-        data.frame("Məlumat" = "PostgreSQL bağlantısı yoxdur - Nəticələr göstərilə bilmir"),
-        options = list(dom = "t"),
-        rownames = FALSE
-      ))
-    }
-    
-    tryCatch({
-      query <- "
-        SELECT 
-          tr.student_name as \"Şagird\",
-          tr.class_level as \"Sinif\",
-          s.school_name as \"Məktəb\",
-          sub.subject_name as \"Fənn\",
-          tr.correct_answers as \"Doğru\",
-          tr.total_questions as \"Ümumi\",
-          tr.percentage as \"Faiz (%)\",
-          ROUND(tr.duration_seconds/60.0, 1) as \"Müddət (dəq)\",
-          DATE(tr.test_date) as \"Tarix\"
-        FROM test_results tr
-        LEFT JOIN schools s ON tr.school_id = s.id
-        LEFT JOIN subjects sub ON tr.subject_id = sub.id
-        ORDER BY tr.test_date DESC
-        LIMIT 100
-      "
+    result <- db_operation_with_retry(function(con) {
+      db_type <- attr(con, "db_type")
+      
+      # PostgreSQL və SQLite üçün fərqli DATE funksiyası
+      date_func <- if(db_type == "postgresql") {
+        "to_char(tr.test_date, 'YYYY-MM-DD') as \"Tarix\""
+      } else {
+        "DATE(tr.test_date) as \"Tarix\""
+      }
+      
+      query <- paste0("
+      SELECT 
+        tr.student_name as \"Şagird\",
+        tr.class_level as \"Sinif\",
+        COALESCE(s.school_name, 'Naməlum məktəb') as \"Məktəb\",
+        COALESCE(sub.subject_name, 'Naməlum fənn') as \"Fənn\",
+        tr.correct_answers as \"Doğru\",
+        tr.total_questions as \"Ümumi\",
+        tr.percentage as \"Faiz (%)\",
+        ROUND(tr.duration_seconds/60.0, 1) as \"Müddət (dəq)\",
+        ", date_func, "
+      FROM test_results tr
+      LEFT JOIN schools s ON tr.school_id = s.id
+      LEFT JOIN subjects sub ON tr.subject_id = sub.id
+      ORDER BY tr.test_date DESC
+      LIMIT 100
+    ")
       
       results <- dbGetQuery(con, query)
-      dbDisconnect(con)
-      
-      if(nrow(results) == 0) {
-        return(DT::datatable(
-          data.frame("Məlumat" = "Hələ heç bir test nəticəsi yoxdur"),
-          options = list(dom = "t"),
-          rownames = FALSE
-        ))
-      }
-      
-      DT::datatable(results, 
-                    options = list(pageLength = 15, scrollX = TRUE),
-                    rownames = FALSE) %>%
-        DT::formatStyle("Faiz (%)", 
-                        backgroundColor = DT::styleInterval(c(60, 80, 90), 
-                                                            c("#f8d7da", "#fff3cd", "#d1ecf1", "#d4edda")))
-    }, error = function(e) {
-      if(!is.null(con)) dbDisconnect(con)
+      cat("Nəticələr alındı -", db_type, "- sayı:", nrow(results), "\n")
+      return(results)
+    })
+    
+    if(is.null(result)) {
       return(DT::datatable(
-        data.frame("Xəta" = paste("Məlumat alınarken xəta:", e$message)),
+        data.frame("Məlumat" = "Veritabanı bağlantısı yoxdur - Nəticələr göstərilə bilmir"),
         options = list(dom = "t"),
         rownames = FALSE
       ))
-    })
+    }
+    
+    if(nrow(result) == 0) {
+      return(DT::datatable(
+        data.frame("Məlumat" = "Hələ heç bir test nəticəsi yoxdur"),
+        options = list(dom = "t"),
+        rownames = FALSE
+      ))
+    }
+    
+    DT::datatable(result, 
+                  options = list(pageLength = 15, scrollX = TRUE),
+                  rownames = FALSE) %>%
+      DT::formatStyle("Faiz (%)", 
+                      backgroundColor = DT::styleInterval(c(60, 80, 90), 
+                                                          c("#f8d7da", "#fff3cd", "#d1ecf1", "#d4edda")))
   })
   
-  # Fənn statistikası
+  # Hibrid fənn statistikası
   output$subject_stats <- renderPlot({
-    con <- get_db_connection()
-    if(is.null(con)) {
+    stats <- db_operation_with_retry(function(con) {
+      db_type <- attr(con, "db_type")
+      
+      query <- "
+      SELECT 
+        sub.subject_name,
+        COUNT(*) as test_count,
+        AVG(tr.percentage) as avg_score
+      FROM test_results tr
+      LEFT JOIN subjects sub ON tr.subject_id = sub.id
+      WHERE sub.subject_name IS NOT NULL
+      GROUP BY sub.subject_name, sub.id
+      ORDER BY avg_score DESC
+    "
+      
+      result <- dbGetQuery(con, query)
+      cat("Statistika alındı -", db_type, "- fənn sayı:", nrow(result), "\n")
+      return(result)
+    })
+    
+    if(is.null(stats) || nrow(stats) == 0) {
       plot.new()
-      text(0.5, 0.5, "PostgreSQL bağlantısı yoxdur\nStatistika göstərilə bilmir", 
-           cex = 1.2, col = "red")
+      db_type <- get_current_db_type()
+      text(0.5, 0.5, paste("Statistika məlumatı yoxdur\nDB tipi:", db_type), 
+           cex = 1.2, col = "gray50")
       return()
     }
     
-    tryCatch({
-      query <- "
-        SELECT 
-          sub.subject_name,
-          COUNT(*) as test_count,
-          AVG(tr.percentage) as avg_score
-        FROM test_results tr
-        LEFT JOIN subjects sub ON tr.subject_id = sub.id
-        WHERE sub.subject_name IS NOT NULL
-        GROUP BY sub.subject_name, sub.id
-        ORDER BY avg_score DESC
-      "
-      
-      stats <- dbGetQuery(con, query)
-      dbDisconnect(con)
-      
-      if(nrow(stats) == 0) {
-        plot.new()
-        text(0.5, 0.5, "Statistika üçün məlumat yoxdur\n(Ən azı bir test tamamlanmalıdır)", 
-             cex = 1.2, col = "gray50")
-        return()
-      }
-      
-      par(mar = c(8, 4, 4, 2), las = 2)
-      barplot(stats$avg_score, 
-              names.arg = stats$subject_name,
-              main = "Fənn üzrə Orta Nəticələr",
-              ylab = "Orta bal (%)",
-              col = rainbow(nrow(stats)),
-              ylim = c(0, 100))
-      abline(h = c(60, 80, 90), col = "red", lty = 2, alpha = 0.5)
-    }, error = function(e) {
-      if(!is.null(con)) {
-        tryCatch(dbDisconnect(con), error = function(e2) {})
-      }
-      plot.new()
-      text(0.5, 0.5, "Statistika xətası", cex = 1.5, col = "red")
-    })
+    par(mar = c(8, 4, 4, 2), las = 2)
+    barplot(stats$avg_score, 
+            names.arg = stats$subject_name,
+            main = paste("Fənn Statistikası (", get_current_db_type(), ")"),
+            ylab = "Orta bal (%)",
+            col = rainbow(nrow(stats)),
+            ylim = c(0, 100))
+    abline(h = c(60, 80, 90), col = "red", lty = 2, alpha = 0.5)
   })
   
-  # Məktəb reytinqi
+  # Hibrid məktəb reytinqi
   output$school_ranking <- renderPlot({
-    con <- get_db_connection()
-    if(is.null(con)) {
+    ranking <- db_operation_with_retry(function(con) {
+      db_type <- attr(con, "db_type")
+      
+      query <- "
+      SELECT 
+        s.school_name,
+        COUNT(*) as test_count,
+        AVG(tr.percentage) as avg_score
+      FROM test_results tr
+      LEFT JOIN schools s ON tr.school_id = s.id
+      WHERE s.school_name IS NOT NULL
+      GROUP BY s.school_name, s.id
+      HAVING COUNT(*) >= 3
+      ORDER BY avg_score DESC
+      LIMIT 10
+    "
+      
+      result <- dbGetQuery(con, query)
+      cat("Məktəb reytinqi alındı -", db_type, "- məktəb sayı:", nrow(result), "\n")
+      return(result)
+    })
+    
+    if(is.null(ranking) || nrow(ranking) == 0) {
       plot.new()
-      text(0.5, 0.5, "PostgreSQL bağlantısı yoxdur\nReytinq göstərilə bilmir", 
-           cex = 1.2, col = "red")
+      db_type <- get_current_db_type()
+      text(0.5, 0.5, paste("Reytinq məlumatı yoxdur\nDB tipi:", db_type, "\n(Ən azı 3 test lazımdır)"), 
+           cex = 1.2, col = "gray50")
       return()
     }
     
-    tryCatch({
-      query <- "
-        SELECT 
-          s.school_name,
-          COUNT(*) as test_count,
-          AVG(tr.percentage) as avg_score
-        FROM test_results tr
-        LEFT JOIN schools s ON tr.school_id = s.id
-        WHERE s.school_name IS NOT NULL
-        GROUP BY s.school_name, s.id
-        HAVING COUNT(*) >= 3
-        ORDER BY avg_score DESC
-        LIMIT 10
-      "
-      
-      ranking <- dbGetQuery(con, query)
-      dbDisconnect(con)
-      
-      if(nrow(ranking) == 0) {
-        plot.new()
-        text(0.5, 0.5, "Reytinq məlumatları yoxdur\n(Ən azı 3 test olmalıdır)", 
-             cex = 1.2, col = "gray50")
-        return()
-      }
-      
-      par(mar = c(12, 4, 4, 2), las = 2)
-      barplot(ranking$avg_score,
-              names.arg = substr(ranking$school_name, 1, 15),
-              main = "Məktəblər üzrə Orta Nəticələr (ən azı 3 test)",
-              ylab = "Orta bal (%)",
-              col = heat.colors(nrow(ranking)),
-              ylim = c(0, 100))
-      abline(h = 75, col = "blue", lty = 2)
-    }, error = function(e) {
-      if(!is.null(con)) {
-        tryCatch(dbDisconnect(con), error = function(e2) {})
-      }
-      plot.new()
-      text(0.5, 0.5, "Reytinq xətası", cex = 1.5, col = "red")
-    })
+    par(mar = c(12, 4, 4, 2), las = 2)
+    barplot(ranking$avg_score,
+            names.arg = substr(ranking$school_name, 1, 15),
+            main = paste("Məktəb Reytinqi (", get_current_db_type(), ")"),
+            ylab = "Orta bal (%)",
+            col = heat.colors(nrow(ranking)),
+            ylim = c(0, 100))
+    abline(h = 75, col = "blue", lty = 2)
   })
 }
-
 # Tətbiqi işə sal
 shinyApp(ui = ui, server = server)
